@@ -294,9 +294,9 @@ jobs:
                   root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       fitsSystemWindows = true
-                      addView(top)
+                      addView(this@MainActivity.top)
                       addView(videoLayout, LinearLayout.LayoutParams(-1, 0, 1f))
-                      addView(bottom)
+                      addView(this@MainActivity.bottom)
                   }
                   setContentView(root)
                   updateVoiceBtn()
