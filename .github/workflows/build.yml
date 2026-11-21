@@ -16,26 +16,23 @@ jobs:
       - name: Create project and build
         run: |
           mkdir -p proj && cd proj
-          mkdir -p $(dirname settings.gradle.kts)
+          mkdir -p app/src/main/java/com/dokan/cam
           cat > settings.gradle.kts <<'EOF_FILE'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
           rootProject.name = "DokanCam"
           include(":app")
           EOF_FILE
-          mkdir -p $(dirname build.gradle.kts)
           cat > build.gradle.kts <<'EOF_FILE'
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           EOF_FILE
-          mkdir -p $(dirname gradle.properties)
           cat > gradle.properties <<'EOF_FILE'
           android.useAndroidX=true
           org.gradle.jvmargs=-Xmx2g
           EOF_FILE
-          mkdir -p $(dirname app/build.gradle.kts)
           cat > app/build.gradle.kts <<'EOF_FILE'
           plugins {
               id("com.android.application")
@@ -48,8 +45,9 @@ jobs:
                   applicationId = "com.dokan.cam"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0"
+                  ndk { abiFilters += listOf("arm64-v8a") }
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -61,12 +59,16 @@ jobs:
               implementation("org.videolan.android:libvlc-all:3.6.0")
           }
           EOF_FILE
-          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
           cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
               <queries>
                   <intent><action android:name="android.speech.RecognitionService" /></intent>
               </queries>
@@ -74,30 +76,89 @@ jobs:
                   android:label="Dokan Cam"
                   android:usesCleartextTraffic="true"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
-                  <activity android:name=".MainActivity" android:exported="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="portrait"
+                      android:supportsPictureInPicture="true"
+                      android:resizeableActivity="true"
+                      android:windowSoftInputMode="stateHidden|adjustPan"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <service
+                      android:name=".KeepAliveService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
               </application>
           </manifest>
           EOF_FILE
-          mkdir -p $(dirname app/src/main/java/com/dokan/cam/MainActivity.kt)
+          cat > app/src/main/java/com/dokan/cam/KeepAliveService.kt <<'EOF_FILE'
+          package com.dokan.cam
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.IBinder
+          import android.os.PowerManager
+
+          class KeepAliveService : Service() {
+              private var wl: PowerManager.WakeLock? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("keep", "Dokan Cam chalu", NotificationManager.IMPORTANCE_LOW))
+                  val pi = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, "keep")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setContentTitle("Dokan Cam chalu ache")
+                      .setContentText("Camera ar voice background e cholche")
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  if (wl == null) {
+                      wl = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dokan:cam").apply { acquire() }
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  wl?.release()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
           cat > app/src/main/java/com/dokan/cam/MainActivity.kt <<'EOF_FILE'
           package com.dokan.cam
 
           import android.Manifest
-          import android.app.Activity
+          import android.app.*
           import android.content.ContentValues
+          import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
+          import android.content.res.Configuration
           import android.graphics.Bitmap
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.net.wifi.WifiManager
           import android.os.*
           import android.provider.MediaStore
           import android.speech.RecognitionListener
           import android.speech.RecognizerIntent
           import android.speech.SpeechRecognizer
+          import android.util.Rational
           import android.view.*
           import android.widget.*
           import org.videolan.libvlc.LibVLC
@@ -113,86 +174,276 @@ jobs:
               private lateinit var player: MediaPlayer
               private lateinit var videoLayout: VLCVideoLayout
               private lateinit var urlEdit: EditText
-              private lateinit var status: TextView
+              private lateinit var wifiTv: TextView
+              private lateinit var stateTv: TextView
+              private lateinit var heardTv: TextView
+              private lateinit var voiceBtn: Button
+              private lateinit var root: LinearLayout
+              private lateinit var top: LinearLayout
+              private lateinit var bottom: LinearLayout
+              private lateinit var prefs: android.content.SharedPreferences
+              private val btns = mutableListOf<Button>()
               private val handler = Handler(Looper.getMainLooper())
               private var sr: SpeechRecognizer? = null
               private var listening = false
               private var recording = false
               private var curFolder = ""
+              private var wantFolder: String? = null
               private var lastCmd = 0L
+              private var lastOk = 0L
+              private var lastConn = 0L
+              private var themeIdx = 0
               private val autoStop = Runnable { stopRecord() }
+
+              // bg, text, button, accent
+              private val themes = listOf(
+                  intArrayOf(0xFF121212.toInt(), 0xFFFFFFFF.toInt(), 0xFF2A2A2A.toInt(), 0xFF00C853.toInt()),
+                  intArrayOf(0xFFF5F7FA.toInt(), 0xFF1B1B1B.toInt(), 0xFFFFFFFF.toInt(), 0xFF1976D2.toInt()),
+                  intArrayOf(0xFF0D1B2A.toInt(), 0xFFE0E1DD.toInt(), 0xFF1B263B.toInt(), 0xFFFFB703.toInt())
+              )
 
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
                   window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                  val prefs = getSharedPreferences("p", MODE_PRIVATE)
-                  libVLC = LibVLC(this, arrayListOf("--rtsp-tcp", "--network-caching=300"))
+                  prefs = getSharedPreferences("p", MODE_PRIVATE)
+                  themeIdx = prefs.getInt("theme", 0)
+                  libVLC = LibVLC(this, arrayListOf("--rtsp-tcp", "--network-caching=200"))
                   player = MediaPlayer(libVLC)
                   videoLayout = VLCVideoLayout(this)
                   player.attachViews(videoLayout, null, false, false)
-                  urlEdit = EditText(this).apply {
-                      setText(prefs.getString("url", "rtsp://192.168.0.105/live/ch00_0"))
-                      setSingleLine()
+                  player.setEventListener { e ->
+                      when (e.type) {
+                          MediaPlayer.Event.Playing -> {
+                              lastOk = SystemClock.elapsedRealtime()
+                              setState("Connected")
+                          }
+                          MediaPlayer.Event.Buffering -> {
+                              if (e.buffering < 100f) setState("Loading " + e.buffering.toInt() + "%")
+                              else { lastOk = SystemClock.elapsedRealtime(); setState("Connected") }
+                          }
+                          MediaPlayer.Event.EncounteredError -> setState("Error, abar connect hobe...")
+                          else -> {}
+                      }
                   }
-                  status = TextView(this).apply { setPadding(16, 8, 16, 8); text = "Ready" }
-                  fun btn(t: String, f: () -> Unit) = Button(this).apply {
-                      text = t; textSize = 12f; isAllCaps = false
-                      setOnClickListener { f() }
-                      layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                  }
-                  val row = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      addView(btn("Connect") {
-                          prefs.edit().putString("url", urlEdit.text.toString().trim()).apply()
-                          connect()
-                      })
-                      addView(btn("Shot") { screenshot() })
-                      addView(btn("Rec") { startRecord("Records") })
-                      addView(btn("Stop") { stopRecord() })
-                      addView(btn("Voice") { toggleVoice() })
-                  }
-                  val root = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      fitsSystemWindows = true
-                      addView(urlEdit); addView(row); addView(status)
-                      addView(videoLayout, LinearLayout.LayoutParams(-1, 0, 1f))
-                  }
-                  setContentView(root)
-                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
-                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                  buildUi()
+                  applyTheme()
+                  connect()
+                  handler.postDelayed(watchdog, 3000)
+                  val perms = if (Build.VERSION.SDK_INT >= 33)
+                      arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+                  else arrayOf(Manifest.permission.RECORD_AUDIO)
+                  val need = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startBackground()
+                  if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
               }
 
-              private fun say(t: String) = runOnUiThread { status.text = t }
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED && !listening) startBackground()
+              }
+
+              private fun startBackground() {
+                  startForegroundService(Intent(this, KeepAliveService::class.java))
+                  startVoice()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun cell() = LinearLayout.LayoutParams(0, dp(56), 1f).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }
+
+              private fun mk(t: String, f: () -> Unit): Button = Button(this).apply {
+                  text = t; textSize = 14f; isAllCaps = false
+                  setOnClickListener { f() }
+                  btns.add(this)
+              }
+
+              private fun buildUi() {
+                  wifiTv = TextView(this).apply { textSize = 14f }
+                  stateTv = TextView(this).apply { textSize = 14f; gravity = Gravity.END }
+                  heardTv = TextView(this).apply { textSize = 12f; text = "Shunchi..."; setPadding(dp(4), dp(4), dp(4), dp(4)) }
+                  urlEdit = EditText(this).apply {
+                      setSingleLine(); textSize = 14f
+                      setText(prefs.getString("url", "rtsp://192.168.1.100/live/ch00_1"))
+                  }
+                  voiceBtn = mk("") { toggleVoice() }
+                  val info = LinearLayout(this).apply {
+                      addView(wifiTv, LinearLayout.LayoutParams(0, -2, 1f))
+                      addView(stateTv, LinearLayout.LayoutParams(0, -2, 1f))
+                  }
+                  val urlRow = LinearLayout(this).apply {
+                      gravity = Gravity.CENTER_VERTICAL
+                      addView(urlEdit, LinearLayout.LayoutParams(0, -2, 1f))
+                      addView(mk("Connect") {
+                          prefs.edit().putString("url", urlEdit.text.toString().trim()).apply()
+                          connect()
+                      }, LinearLayout.LayoutParams(-2, dp(48)))
+                  }
+                  top = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(12), dp(8), dp(12), dp(4))
+                      addView(info); addView(urlRow)
+                  }
+                  fun row(vararg b: Button) = LinearLayout(this).apply { b.forEach { addView(it, cell()) } }
+                  bottom = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(8), dp(4), dp(8), dp(8))
+                      addView(heardTv)
+                      addView(row(mk("📷 Screenshot") { screenshot() }, mk("⏺ Record") { startRecord("Records") }, mk("⏹ Stop") { stopRecord() }))
+                      addView(row(mk("💰 Baki") { bakiRecord() }, voiceBtn, mk("🎨 Style") { cycleStyle() }))
+                  }
+                  root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      fitsSystemWindows = true
+                      addView(top)
+                      addView(videoLayout, LinearLayout.LayoutParams(-1, 0, 1f))
+                      addView(bottom)
+                  }
+                  setContentView(root)
+                  updateVoiceBtn()
+              }
+
+              private fun applyTheme() {
+                  val t = themes[themeIdx]
+                  root.setBackgroundColor(t[0])
+                  wifiTv.setTextColor(t[1]); heardTv.setTextColor(t[1])
+                  stateTv.setTextColor(t[3])
+                  urlEdit.setTextColor(t[1])
+                  btns.forEach { b ->
+                      b.setTextColor(t[1])
+                      b.background = GradientDrawable().apply {
+                          cornerRadius = dp(14).toFloat()
+                          setColor(t[2])
+                          setStroke(dp(2), t[3])
+                      }
+                  }
+              }
+
+              private fun cycleStyle() {
+                  themeIdx = (themeIdx + 1) % themes.size
+                  prefs.edit().putInt("theme", themeIdx).apply()
+                  applyTheme()
+              }
+
+              private fun say(t: String) = runOnUiThread { heardTv.text = t }
+              private fun setState(t: String) = runOnUiThread { stateTv.text = t }
               private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
+              private fun notifyUser(title: String, text: String) {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("ev", "Events", NotificationManager.IMPORTANCE_DEFAULT))
+                  val n = Notification.Builder(this, "ev")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setAutoCancel(true)
+                      .build()
+                  nm.notify(System.currentTimeMillis().toInt(), n)
+              }
+
+              // ---- Connection ----
               private fun connect() {
-                  val m = Media(libVLC, android.net.Uri.parse(urlEdit.text.toString().trim()))
-                  m.addOption(":network-caching=300")
+                  lastConn = SystemClock.elapsedRealtime()
+                  setState("Connecting...")
+                  if (recording) stopFile()
+                  player.stop()
+                  val m = Media(libVLC, Uri.parse(urlEdit.text.toString().trim()))
+                  m.addOption(":network-caching=200")
                   player.media = m
                   m.release()
                   player.play()
-                  say("Connecting...")
               }
 
+              private val watchdog = object : Runnable {
+                  override fun run() {
+                      val now = SystemClock.elapsedRealtime()
+                      if (player.isPlaying) lastOk = now
+                      else if (now - maxOf(lastOk, lastConn) > 8000) connect()
+                      wantFolder?.let { if (!recording && player.isPlaying) startRecord(it) }
+                      updateWifi()
+                      handler.postDelayed(this, 3000)
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun updateWifi() {
+                  val w = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                  val r = w.connectionInfo?.rssi ?: -127
+                  wifiTv.text = if (r <= -100) "WiFi nai" else {
+                      val q = if (r >= -55) "Bhalo" else if (r >= -70) "Moderate" else "Dubol"
+                      "WiFi: " + r + " dBm (" + q + ")"
+                  }
+              }
+
+              // ---- Record / Screenshot ----
               private fun startRecord(folder: String) {
-                  if (!player.isPlaying) { say("Age Connect korun"); return }
+                  if (!player.isPlaying) { say("Video chalu nai, record hobe na"); return }
                   if (recording && curFolder == folder) return
-                  if (recording) stopRecord()
+                  if (recording) stopFile()
                   val dir = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), folder).apply { mkdirs() }
                   recording = player.record(dir.absolutePath)
                   curFolder = folder
+                  wantFolder = if (recording) folder else null
                   say(if (recording) "Recording... ($folder)" else "Record shuru hoyni")
               }
 
               private fun stopRecord() {
+                  wantFolder = null
                   handler.removeCallbacks(autoStop)
-                  if (recording) { player.record(null); recording = false; say("Record shesh, save hoyeche") }
+                  stopFile()
+              }
+
+              private fun stopFile() {
+                  if (recording) {
+                      player.record(null)
+                      recording = false
+                      saveFiles(curFolder)
+                  }
               }
 
               private fun bakiRecord() {
+                  val fresh = !(recording && curFolder == "Baki")
                   startRecord("Baki")
+                  if (fresh && recording) notifyUser("Baki", "Baki shunlam, recording shuru hoyeche")
                   handler.removeCallbacks(autoStop)
                   handler.postDelayed(autoStop, 120_000)
+              }
+
+              private fun saveFiles(folder: String) {
+                  val dir = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), folder)
+                  Thread {
+                      Thread.sleep(2500)
+                      var n = 0
+                      dir.listFiles()
+                          ?.filter { it.isFile && it.length() > 0 && System.currentTimeMillis() - it.lastModified() > 2000 }
+                          ?.forEach { f ->
+                              try { copyToGallery(f, folder); n++ } catch (e: Exception) { }
+                          }
+                      if (n > 0) {
+                          say("Video save hoyeche (Gallery > DokanCam)")
+                          notifyUser("Video save hoyeche", "Gallery > Movies > DokanCam > " + folder)
+                      }
+                  }.start()
+              }
+
+              private fun copyToGallery(f: File, folder: String) {
+                  val ext = f.extension.lowercase()
+                  val mime = when (ext) {
+                      "ts" -> "video/mp2t"
+                      "mkv" -> "video/x-matroska"
+                      else -> "video/mp4"
+                  }
+                  val cv = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, folder + "_" + f.name)
+                      put(MediaStore.Video.Media.MIME_TYPE, mime)
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/DokanCam/" + folder)
+                      put(MediaStore.Video.Media.IS_PENDING, 1)
+                  }
+                  val u = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv) ?: return
+                  contentResolver.openOutputStream(u)?.use { out -> f.inputStream().use { it.copyTo(out) } }
+                  cv.clear()
+                  cv.put(MediaStore.Video.Media.IS_PENDING, 0)
+                  contentResolver.update(u, cv, null, null)
+                  f.delete()
               }
 
               private fun findSurface(v: View): SurfaceView? {
@@ -212,27 +463,42 @@ jobs:
 
               private fun saveShot(b: Bitmap) {
                   val v = ContentValues().apply {
-                      put(MediaStore.Images.Media.DISPLAY_NAME, "shot_${stamp()}.jpg")
+                      put(MediaStore.Images.Media.DISPLAY_NAME, "shot_" + stamp() + ".jpg")
                       put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                       put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DokanCam")
                   }
                   contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)?.let { u ->
                       contentResolver.openOutputStream(u)?.use { b.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-                      say("Screenshot save hoyeche (Gallery > DokanCam)")
+                      say("Screenshot save hoyeche")
+                      notifyUser("Screenshot save hoyeche", "Gallery > DokanCam")
                   }
               }
 
               // ---- Voice ----
+              private fun updateVoiceBtn() {
+                  voiceBtn.text = if (listening) "🎤 Voice: ON" else "🎤 Voice: OFF"
+              }
+
               private fun toggleVoice() {
-                  if (listening) { listening = false; sr?.destroy(); sr = null; say("Voice OFF"); return }
-                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1); return
-                  }
+                  if (listening) stopVoice()
+                  else if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                  else startVoice()
+              }
+
+              private fun startVoice() {
+                  if (listening) return
                   if (!SpeechRecognizer.isRecognitionAvailable(this)) { say("Speech service nai"); return }
                   listening = true
                   sr = SpeechRecognizer.createSpeechRecognizer(this).apply { setRecognitionListener(listener) }
-                  say("Voice ON: baki / screenshot / record / stop")
+                  updateVoiceBtn()
                   listen()
+              }
+
+              private fun stopVoice() {
+                  listening = false
+                  sr?.destroy(); sr = null
+                  updateVoiceBtn()
               }
 
               private fun listen() {
@@ -246,6 +512,7 @@ jobs:
 
               private fun words(b: Bundle?) {
                   val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.joinToString(" ")?.lowercase() ?: return
+                  if (t.isNotBlank()) say("Shunlam: " + t)
                   if (SystemClock.elapsedRealtime() - lastCmd < 3000) return
                   fun has(vararg k: String) = k.any { t.contains(it) }
                   when {
@@ -267,12 +534,36 @@ jobs:
                   override fun onEvent(t: Int, p: Bundle?) {}
                   override fun onPartialResults(b: Bundle?) = words(b)
                   override fun onResults(b: Bundle?) { words(b); handler.postDelayed({ listen() }, 200) }
-                  override fun onError(e: Int) { handler.postDelayed({ listen() }, 500) }
+                  override fun onError(e: Int) { handler.postDelayed({ listen() }, 700) }
+              }
+
+              // ---- Background / PiP ----
+              override fun onUserLeaveHint() {
+                  if (player.isPlaying) {
+                      try {
+                          enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build())
+                      } catch (e: Exception) { }
+                  }
+              }
+
+              override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+                  super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+                  val v = if (isInPictureInPictureMode) View.GONE else View.VISIBLE
+                  top.visibility = v
+                  bottom.visibility = v
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onBackPressed() {
+                  moveTaskToBack(true)
               }
 
               override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
                   listening = false
                   sr?.destroy()
+                  if (recording) { player.record(null); recording = false }
+                  stopService(Intent(this, KeepAliveService::class.java))
                   player.release(); libVLC.release()
                   super.onDestroy()
               }
